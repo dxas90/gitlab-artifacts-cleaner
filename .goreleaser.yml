@@ -1,4 +1,4 @@
-project_name: artifact-cleaner
+project_name: gitlab-artifacts-cleaner
 
 before:
   hooks:
@@ -8,7 +8,7 @@ before:
 builds:
   - id: artifact-cleaner
     main: ./main.go
-    binary: artifact-cleaner
+    binary: gitlab-artifacts-cleaner
     env:
       - CGO_ENABLED=0
     goos:
