@@ -38,6 +38,19 @@ You can run the tool directly or configure it with environment variables.
 | `GITLAB_END_JOB`      | `120`               | Ending job ID (inclusive).                    |
 | `GITLAB_CONCURRENCY`  | `5`                 | Max concurrent deletions.                     |
 
+### Command-Line Flags
+
+```shell
+./artifact-cleaner \
+  --project=42 \
+  --gitlab-server=gitlab.mycompany.com \
+  --gitlab-token=glpat-xxxxxxxxxxxxxxxx \
+  --gitlab-start-job=200 \
+  --gitlab-end-job=210 \
+  --gitlab-concurrency=10 \
+  --log-file=artifact-cleaner.log
+```
+
 ### Example
 
 Delete artifacts for jobs `200` through `210` in project `42`:
@@ -53,11 +66,12 @@ Delete artifacts for jobs `200` through `210` in project `42`:
 
 Sample output:
 
-    Job 200: artifact deleted successfully  
-    Job 201: artifact deleted successfully  
-    Job 202: failed to delete artifact (status: 404 Not Found)  
-    ...  
-    All artifact deletions attempted.  
+    Job 200: artifact deleted successfully
+    Job 201: artifact deleted successfully
+    Job 202: no artifacts found
+    ...
+    All artifact deletions attempted. Successes: 9, Failures: 1
+
 
 ## Notes
 
