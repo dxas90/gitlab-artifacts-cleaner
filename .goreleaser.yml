@@ -1,0 +1,49 @@
+# .goreleaser.yml
+project_name: artifact-cleaner
+
+before:
+  hooks:
+    # Runs go mod tidy before building
+    - go mod tidy
+
+builds:
+  - id: artifact-cleaner
+    main: ./main.go
+    binary: artifact-cleaner
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    builds:
+      - artifact-cleaner
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    replacements:
+      darwin: macOS
+      linux: Linux
+      windows: Windows
+      amd64: x86_64
+      arm64: ARM64
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  name_template: "{{ .Tag }}-next"
+
+changelog:
+  use: git
+
+release:
+  github:
+    owner: dxas90
+    name: gitlab-artifact-cleaner
+

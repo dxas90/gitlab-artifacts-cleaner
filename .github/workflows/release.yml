@@ -1,0 +1,37 @@
+# .github/workflows/release.yml
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"   # run only on version tags like v1.0.0
+
+permissions:
+  contents: write   # needed for creating GitHub releases
+  packages: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required for GoReleaser to generate changelogs
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+        go-version-file: 'go.mod'
+
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
