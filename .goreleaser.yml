@@ -1,4 +1,3 @@
-# .goreleaser.yml
 project_name: artifact-cleaner
 
 before:
@@ -26,12 +25,6 @@ archives:
       - artifact-cleaner
     format: tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    replacements:
-      darwin: macOS
-      linux: Linux
-      windows: Windows
-      amd64: x86_64
-      arm64: ARM64
 
 checksum:
   name_template: "checksums.txt"
@@ -46,4 +39,3 @@ release:
   github:
     owner: dxas90
     name: gitlab-artifact-cleaner
-
