@@ -38,4 +38,4 @@ changelog:
 release:
   github:
     owner: dxas90
-    name: gitlab-artifact-cleaner
+    name: gitlab-artifacts-cleaner
