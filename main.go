@@ -53,7 +53,11 @@ func projectExists(ctx context.Context, server, token string, projectID int) (bo
 	if err != nil {
 		return false, fmt.Errorf("failed to execute request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("failed to close response body: %v", err)
+		}
+	}()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -115,7 +119,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 			if verbose {
 				fmt.Println(msg)
 			} else if bar != nil {
-				bar.Add(1)
+				_ = bar.Add(1)
 			}
 			logger.Println(msg)
 			atomic.AddInt64(failureCounter, 1)
@@ -140,14 +144,18 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		if verbose {
 			fmt.Println(msg)
 		} else if bar != nil {
-			bar.Add(1)
+			_ = bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(failureCounter, 1)
 		atomic.AddInt64(processedCounter, 1)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Printf("Job %d: failed to close response body: %v", jobID, err)
+		}
+	}()
 
 	switch resp.StatusCode {
 	case http.StatusNoContent:
@@ -155,7 +163,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		if verbose {
 			fmt.Println(msg)
 		} else if bar != nil {
-			bar.Add(1)
+			_ = bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(successCounter, 1)
@@ -165,7 +173,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		if verbose {
 			fmt.Println(msg)
 		} else if bar != nil {
-			bar.Add(1)
+			_ = bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(skippedCounter, 1)
@@ -175,7 +183,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		if verbose {
 			fmt.Println(msg)
 		} else if bar != nil {
-			bar.Add(1)
+			_ = bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(failureCounter, 1)
@@ -237,7 +245,11 @@ and graceful shutdown on interrupt signals.`,
 				fmt.Printf("Failed to open log file %s: %v\n", logFile, err)
 				os.Exit(1)
 			}
-			defer f.Close()
+			defer func() {
+				if err := f.Close(); err != nil {
+					fmt.Printf("Failed to close log file: %v\n", err)
+				}
+			}()
 			logger := log.New(f, "", log.LstdFlags)
 
 			// Setup context with cancellation
@@ -332,7 +344,9 @@ and graceful shutdown on interrupt signals.`,
 
 			wg.Wait()
 			if bar != nil {
-				bar.Finish()
+				if err := bar.Finish(); err != nil {
+					fmt.Printf("Failed to finish progress bar: %v\n", err)
+				}
 				fmt.Println() // Add spacing after progress bar
 			}
 			duration := time.Since(startTime)
@@ -368,10 +382,14 @@ and graceful shutdown on interrupt signals.`,
 
 	// Only mark required if no env var is set
 	if getEnv("GITLAB_TOKEN", "") == "" {
-		rootCmd.MarkFlagRequired("gitlab-token")
+		if err := rootCmd.MarkFlagRequired("gitlab-token"); err != nil {
+			fmt.Printf("Failed to mark gitlab-token as required: %v\n", err)
+		}
 	}
 	if getEnv("GITLAB_PROJECT_ID", "") == "" {
-		rootCmd.MarkFlagRequired("project")
+		if err := rootCmd.MarkFlagRequired("project"); err != nil {
+			fmt.Printf("Failed to mark project as required: %v\n", err)
+		}
 	}
 
 	if err := rootCmd.Execute(); err != nil {
