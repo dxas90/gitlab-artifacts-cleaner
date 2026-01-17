@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,9 +20,8 @@ import (
 )
 
 // Shared HTTP client with connection pooling for reuse across all requests.
-// Creating a new client for each request is inefficient and can lead to port exhaustion.
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -29,8 +29,17 @@ var httpClient = &http.Client{
 	},
 }
 
-// getEnv returns the value of an environment variable or a default value if not set.
-// This is useful for providing fallback values when environment variables are not configured.
+// Job represents a GitLab CI/CD job from the API
+type Job struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	Artifacts []struct {
+		FileType string `json:"file_type"`
+		Size     int    `json:"size"`
+	} `json:"artifacts"`
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -39,10 +48,9 @@ func getEnv(key, defaultValue string) string {
 }
 
 // projectExists checks if a GitLab project exists using the GitLab API.
-// It returns true if the project exists, false if not found, and an error if the request fails.
 func projectExists(ctx context.Context, server, token string, projectID int) (bool, error) {
-	url := fmt.Sprintf("https://%s/api/v4/projects/%d", server, projectID)
-	req, err := http.NewRequest("GET", url, nil)
+	apiURL := fmt.Sprintf("https://%s/api/v4/projects/%d", server, projectID)
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return false, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -69,25 +77,86 @@ func projectExists(ctx context.Context, server, token string, projectID int) (bo
 	}
 }
 
+// listJobs fetches all jobs from a GitLab project with pagination
+func listJobs(ctx context.Context, server, token string, projectID, pageLimit int, logger *log.Logger) ([]Job, error) {
+	var allJobs []Job
+	page := 1
+	perPage := 100
+
+	logger.Printf("Fetching jobs from project %d (page limit: %d)...", projectID, pageLimit)
+
+	for {
+		if ctx.Err() != nil {
+			return allJobs, ctx.Err()
+		}
+
+		apiURL := fmt.Sprintf("https://%s/api/v4/projects/%d/jobs?per_page=%d&page=%d",
+			server, projectID, perPage, page)
+
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req = req.WithContext(ctx)
+		req.Header.Set("PRIVATE-TOKEN", token)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		}
+
+		var jobs []Job
+		if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+		_ = resp.Body.Close()
+
+		if len(jobs) == 0 {
+			break
+		}
+
+		allJobs = append(allJobs, jobs...)
+		logger.Printf("Fetched page %d: %d jobs (total so far: %d)", page, len(jobs), len(allJobs))
+		fmt.Printf("\rFetching jobs... %d found so far", len(allJobs))
+
+		// Check for next page
+		if len(jobs) < perPage {
+			break
+		}
+		page++
+		if pageLimit > 0 && page > pageLimit {
+			logger.Printf("Reached page limit (%d), stopping job discovery", pageLimit)
+			break
+		}
+	}
+
+	fmt.Println() // newline after progress
+	logger.Printf("Total jobs fetched: %d", len(allJobs))
+	return allJobs, nil
+}
+
 // deleteArtifact deletes a job artifact from GitLab with automatic retries.
-// It supports dry-run mode where no actual deletion occurs, and uses context for cancellation.
-// Results are logged both to console and a log file, with separate counters for tracking.
 func deleteArtifact(ctx context.Context, server, token string, projectID, jobID int, dryRun, verbose bool, wg *sync.WaitGroup, sem chan struct{}, successCounter, failureCounter, skippedCounter, processedCounter *int64, bar *progressbar.ProgressBar, logger *log.Logger) {
 	defer wg.Done()
 
 	select {
-	case sem <- struct{}{}: // acquire semaphore
+	case sem <- struct{}{}:
 	case <-ctx.Done():
 		return
 	}
-	defer func() { <-sem }() // release semaphore
+	defer func() { <-sem }()
 
-	// Check if context is cancelled before starting
 	if ctx.Err() != nil {
 		return
 	}
 
-	url := fmt.Sprintf("https://%s/api/v4/projects/%d/jobs/%d/artifacts", server, projectID, jobID)
+	apiURL := fmt.Sprintf("https://%s/api/v4/projects/%d/jobs/%d/artifacts", server, projectID, jobID)
 
 	if dryRun {
 		msg := fmt.Sprintf("Job %d: [DRY-RUN] Would delete artifact", jobID)
@@ -106,14 +175,12 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 	var err error
 
 	// Retry logic with exponential backoff
-	// Recreate request on each attempt to ensure fresh context
 	for i := 0; i < 3; i++ {
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Create new request for each retry attempt
-		req, reqErr := http.NewRequest("DELETE", url, nil)
+		req, reqErr := http.NewRequest("DELETE", apiURL, nil)
 		if reqErr != nil {
 			msg := fmt.Sprintf("Job %d: failed to create request: %v", jobID, reqErr)
 			if verbose {
@@ -134,7 +201,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 			break
 		}
 
-		if i < 2 { // Don't sleep on last iteration
+		if i < 2 {
 			time.Sleep(time.Duration(i+1) * 2 * time.Second)
 		}
 	}
@@ -191,9 +258,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 	}
 }
 
-// validateInputs performs validation on all input parameters.
-// Returns an error if any validation fails.
-func validateInputs(server, token string, projectID, startJob, endJob, concurrency int) error {
+func validateInputs(server, token string, projectID, concurrency int) error {
 	if server == "" {
 		return fmt.Errorf("gitlab-server cannot be empty")
 	}
@@ -203,38 +268,28 @@ func validateInputs(server, token string, projectID, startJob, endJob, concurren
 	if projectID <= 0 {
 		return fmt.Errorf("project ID must be positive, got %d", projectID)
 	}
-	if startJob <= 0 {
-		return fmt.Errorf("start job ID must be positive, got %d", startJob)
-	}
-	if endJob < startJob {
-		return fmt.Errorf("end job ID (%d) cannot be less than start job ID (%d)", endJob, startJob)
-	}
 	if concurrency < 1 || concurrency > 1000 {
 		return fmt.Errorf("concurrency must be between 1 and 1000, got %d", concurrency)
-	}
-	totalJobs := endJob - startJob + 1
-	if totalJobs > 1000000 {
-		return fmt.Errorf("job range too large (%d jobs), maximum is 1,000,000", totalJobs)
 	}
 	return nil
 }
 
 func main() {
 	var server, token string
-	var projectID, startJob, endJob, concurrency int
+	var projectID, concurrency, pageLimit int
 	var logFile string
 	var dryRun, verbose bool
 
 	rootCmd := &cobra.Command{
 		Use:   "gitlab-artifacts-cleaner",
-		Short: "Delete GitLab job artifacts concurrently",
-		Long: `A tool to delete GitLab job artifacts for a range of job IDs.
+		Short: "Delete all GitLab job artifacts from a project",
+		Long: `A tool to automatically discover and delete all job artifacts from a GitLab project.
 
-Supports concurrent deletions with configurable rate limiting, dry-run mode,
-and graceful shutdown on interrupt signals.`,
+The tool uses the GitLab Jobs API to discover all jobs in the project, then
+deletes their artifacts concurrently with configurable rate limiting.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			// Input validation
-			if err := validateInputs(server, token, projectID, startJob, endJob, concurrency); err != nil {
+			if err := validateInputs(server, token, projectID, concurrency); err != nil {
 				fmt.Printf("Validation error: %v\n", err)
 				os.Exit(1)
 			}
@@ -256,7 +311,7 @@ and graceful shutdown on interrupt signals.`,
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			// Handle interrupt signals for graceful shutdown
+			// Handle interrupt signals
 			sigChan := make(chan os.Signal, 1)
 			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 			go func() {
@@ -271,15 +326,14 @@ and graceful shutdown on interrupt signals.`,
 			fmt.Printf("========================\n")
 			fmt.Printf("Server:      %s\n", server)
 			fmt.Printf("Project ID:  %d\n", projectID)
-			fmt.Printf("Job Range:   %d - %d\n", startJob, endJob)
 			fmt.Printf("Concurrency: %d\n", concurrency)
 			fmt.Printf("Dry Run:     %v\n", dryRun)
 			fmt.Printf("Verbose:     %v\n", verbose)
 			fmt.Printf("Log File:    %s\n", logFile)
 			fmt.Printf("========================\n\n")
 
-			logger.Printf("Starting artifact cleanup: server=%s, project=%d, jobs=%d-%d, concurrency=%d, dryRun=%v",
-				server, projectID, startJob, endJob, concurrency, dryRun)
+			logger.Printf("Starting artifact cleanup: server=%s, project=%d, concurrency=%d, dryRun=%v",
+				server, projectID, concurrency, dryRun)
 
 			// Validate project exists
 			fmt.Println("Validating project...")
@@ -297,12 +351,30 @@ and graceful shutdown on interrupt signals.`,
 			}
 			fmt.Printf("✓ Project validated\n\n")
 
+			// Fetch all jobs
+			fmt.Println("Discovering jobs from GitLab API...")
+			jobs, err := listJobs(ctx, server, token, projectID, pageLimit, logger)
+			if err != nil {
+				logger.Printf("Error fetching jobs: %v\n", err)
+				fmt.Printf("Error fetching jobs: %v\n", err)
+				os.Exit(1)
+			}
+
+			if len(jobs) == 0 {
+				fmt.Println("No jobs found in project")
+				logger.Println("No jobs found in project")
+				return
+			}
+
+			fmt.Printf("✓ Discovered %d jobs\n\n", len(jobs))
+			logger.Printf("Discovered %d jobs", len(jobs))
+
 			// Delete artifacts concurrently
 			var wg sync.WaitGroup
 			sem := make(chan struct{}, concurrency)
 			var successCounter, failureCounter, skippedCounter, processedCounter int64
 
-			totalJobs := endJob - startJob + 1
+			totalJobs := len(jobs)
 			if dryRun {
 				fmt.Printf("[DRY-RUN MODE] Would process %d jobs\n\n", totalJobs)
 			} else {
@@ -311,7 +383,7 @@ and graceful shutdown on interrupt signals.`,
 
 			startTime := time.Now()
 
-			// Create progress bar for non-verbose mode
+			// Create progress bar
 			var bar *progressbar.ProgressBar
 			if !verbose {
 				bar = progressbar.NewOptions(totalJobs,
@@ -333,13 +405,13 @@ and graceful shutdown on interrupt signals.`,
 				)
 			}
 
-			for jobID := startJob; jobID <= endJob; jobID++ {
+			for _, job := range jobs {
 				if ctx.Err() != nil {
 					fmt.Println("\nCancellation requested, waiting for ongoing operations...")
 					break
 				}
 				wg.Add(1)
-				go deleteArtifact(ctx, server, token, projectID, jobID, dryRun, verbose, &wg, sem, &successCounter, &failureCounter, &skippedCounter, &processedCounter, bar, logger)
+				go deleteArtifact(ctx, server, token, projectID, job.ID, dryRun, verbose, &wg, sem, &successCounter, &failureCounter, &skippedCounter, &processedCounter, bar, logger)
 			}
 
 			wg.Wait()
@@ -347,7 +419,7 @@ and graceful shutdown on interrupt signals.`,
 				if err := bar.Finish(); err != nil {
 					fmt.Printf("Failed to finish progress bar: %v\n", err)
 				}
-				fmt.Println() // Add spacing after progress bar
+				fmt.Println()
 			}
 			duration := time.Since(startTime)
 
@@ -363,24 +435,22 @@ and graceful shutdown on interrupt signals.`,
 		},
 	}
 
-	// Convert environment variables to int, with defaults
+	// Convert environment variables to int
 	projectID, _ = strconv.Atoi(getEnv("GITLAB_PROJECT_ID", "1"))
-	startJobDefault, _ := strconv.Atoi(getEnv("GITLAB_START_JOB", "1"))
-	endJobDefault, _ := strconv.Atoi(getEnv("GITLAB_END_JOB", "120"))
-	concurrencyDefault, _ := strconv.Atoi(getEnv("GITLAB_CONCURRENCY", "100"))
+	concurrencyDefault, _ := strconv.Atoi(getEnv("GITLAB_CONCURRENCY", "70"))
+	pageLimitDefault, _ := strconv.Atoi(getEnv("GITLAB_JOB_PAGE_LIMIT", "0"))
 
-	// Flags with environment variable defaults
+	// Flags
 	rootCmd.Flags().StringVar(&server, "gitlab-server", getEnv("GITLAB_SERVER", "gitlab.example.com"), "GitLab server hostname (without https://)")
 	rootCmd.Flags().StringVar(&token, "gitlab-token", getEnv("GITLAB_TOKEN", ""), "GitLab private access token (required)")
 	rootCmd.Flags().IntVar(&projectID, "project", projectID, "GitLab project ID (required)")
-	rootCmd.Flags().IntVar(&startJob, "gitlab-start-job", startJobDefault, "Starting job ID (inclusive)")
-	rootCmd.Flags().IntVar(&endJob, "gitlab-end-job", endJobDefault, "Ending job ID (inclusive)")
-	rootCmd.Flags().IntVar(&concurrency, "gitlab-concurrency", concurrencyDefault, "Maximum concurrent deletions (1-1000)")
+	rootCmd.Flags().IntVar(&concurrency, "concurrency", concurrencyDefault, "Maximum concurrent deletions (1-1000)")
+	rootCmd.Flags().IntVar(&pageLimit, "page-limit", pageLimitDefault, "Maximum pages to fetch from Jobs API (0 = unlimited)")
 	rootCmd.Flags().StringVar(&logFile, "log-file", "artifact-cleaner.log", "Path to log file")
 	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview what would be deleted without actually deleting")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 
-	// Only mark required if no env var is set
+	// Mark required flags
 	if getEnv("GITLAB_TOKEN", "") == "" {
 		if err := rootCmd.MarkFlagRequired("gitlab-token"); err != nil {
 			fmt.Printf("Failed to mark gitlab-token as required: %v\n", err)
