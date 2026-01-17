@@ -13,8 +13,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/k0kubun/go-ansi"
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
+
+// Shared HTTP client with connection pooling for reuse across all requests.
+// Creating a new client for each request is inefficient and can lead to port exhaustion.
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // getEnv returns the value of an environment variable or a default value if not set.
 // This is useful for providing fallback values when environment variables are not configured.
@@ -36,8 +49,7 @@ func projectExists(ctx context.Context, server, token string, projectID int) (bo
 	req = req.WithContext(ctx)
 	req.Header.Set("PRIVATE-TOKEN", token)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("failed to execute request: %w", err)
 	}
@@ -56,7 +68,7 @@ func projectExists(ctx context.Context, server, token string, projectID int) (bo
 // deleteArtifact deletes a job artifact from GitLab with automatic retries.
 // It supports dry-run mode where no actual deletion occurs, and uses context for cancellation.
 // Results are logged both to console and a log file, with separate counters for tracking.
-func deleteArtifact(ctx context.Context, server, token string, projectID, jobID int, dryRun, verbose bool, wg *sync.WaitGroup, sem chan struct{}, successCounter, failureCounter, skippedCounter *int64, logger *log.Logger) {
+func deleteArtifact(ctx context.Context, server, token string, projectID, jobID int, dryRun, verbose bool, wg *sync.WaitGroup, sem chan struct{}, successCounter, failureCounter, skippedCounter, processedCounter *int64, bar *progressbar.ProgressBar, logger *log.Logger) {
 	defer wg.Done()
 
 	select {
@@ -77,33 +89,43 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		msg := fmt.Sprintf("Job %d: [DRY-RUN] Would delete artifact", jobID)
 		if verbose {
 			fmt.Println(msg)
+		} else if bar != nil {
+			bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(skippedCounter, 1)
+		atomic.AddInt64(processedCounter, 1)
 		return
 	}
 
-	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		msg := fmt.Sprintf("Job %d: failed to create request: %v", jobID, err)
-		fmt.Println(msg)
-		logger.Println(msg)
-		atomic.AddInt64(failureCounter, 1)
-		return
-	}
-	req = req.WithContext(ctx)
-	req.Header.Set("PRIVATE-TOKEN", token)
-
-	client := &http.Client{Timeout: 10 * time.Second}
 	var resp *http.Response
+	var err error
 
 	// Retry logic with exponential backoff
+	// Recreate request on each attempt to ensure fresh context
 	for i := 0; i < 3; i++ {
 		if ctx.Err() != nil {
 			return
 		}
 
-		resp, err = client.Do(req)
+		// Create new request for each retry attempt
+		req, reqErr := http.NewRequest("DELETE", url, nil)
+		if reqErr != nil {
+			msg := fmt.Sprintf("Job %d: failed to create request: %v", jobID, reqErr)
+			if verbose {
+				fmt.Println(msg)
+			} else if bar != nil {
+				bar.Add(1)
+			}
+			logger.Println(msg)
+			atomic.AddInt64(failureCounter, 1)
+			atomic.AddInt64(processedCounter, 1)
+			return
+		}
+		req = req.WithContext(ctx)
+		req.Header.Set("PRIVATE-TOKEN", token)
+
+		resp, err = httpClient.Do(req)
 		if err == nil {
 			break
 		}
@@ -115,9 +137,14 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 
 	if err != nil {
 		msg := fmt.Sprintf("Job %d: request failed after retries: %v", jobID, err)
-		fmt.Println(msg)
+		if verbose {
+			fmt.Println(msg)
+		} else if bar != nil {
+			bar.Add(1)
+		}
 		logger.Println(msg)
 		atomic.AddInt64(failureCounter, 1)
+		atomic.AddInt64(processedCounter, 1)
 		return
 	}
 	defer resp.Body.Close()
@@ -127,21 +154,32 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		msg := fmt.Sprintf("Job %d: artifact deleted successfully", jobID)
 		if verbose {
 			fmt.Println(msg)
+		} else if bar != nil {
+			bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(successCounter, 1)
+		atomic.AddInt64(processedCounter, 1)
 	case http.StatusNotFound:
 		msg := fmt.Sprintf("Job %d: no artifacts found", jobID)
 		if verbose {
 			fmt.Println(msg)
+		} else if bar != nil {
+			bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(skippedCounter, 1)
+		atomic.AddInt64(processedCounter, 1)
 	default:
 		msg := fmt.Sprintf("Job %d: failed to delete artifact (status: %s)", jobID, resp.Status)
-		fmt.Println(msg)
+		if verbose {
+			fmt.Println(msg)
+		} else if bar != nil {
+			bar.Add(1)
+		}
 		logger.Println(msg)
 		atomic.AddInt64(failureCounter, 1)
+		atomic.AddInt64(processedCounter, 1)
 	}
 }
 
@@ -250,7 +288,7 @@ and graceful shutdown on interrupt signals.`,
 			// Delete artifacts concurrently
 			var wg sync.WaitGroup
 			sem := make(chan struct{}, concurrency)
-			var successCounter, failureCounter, skippedCounter int64
+			var successCounter, failureCounter, skippedCounter, processedCounter int64
 
 			totalJobs := endJob - startJob + 1
 			if dryRun {
@@ -261,22 +299,45 @@ and graceful shutdown on interrupt signals.`,
 
 			startTime := time.Now()
 
+			// Create progress bar for non-verbose mode
+			var bar *progressbar.ProgressBar
+			if !verbose {
+				bar = progressbar.NewOptions(totalJobs,
+					progressbar.OptionSetWriter(ansi.NewAnsiStdout()),
+					progressbar.OptionEnableColorCodes(true),
+					progressbar.OptionSetWidth(40),
+					progressbar.OptionSetDescription("[cyan]Deleting artifacts[reset]"),
+					progressbar.OptionSetTheme(progressbar.Theme{
+						Saucer:        "[green]=[reset]",
+						SaucerHead:    "[green]>[reset]",
+						SaucerPadding: " ",
+						BarStart:      "[",
+						BarEnd:        "]",
+					}),
+					progressbar.OptionShowCount(),
+					progressbar.OptionShowIts(),
+					progressbar.OptionSetItsString("jobs"),
+					progressbar.OptionThrottle(100*time.Millisecond),
+				)
+			}
+
 			for jobID := startJob; jobID <= endJob; jobID++ {
 				if ctx.Err() != nil {
 					fmt.Println("\nCancellation requested, waiting for ongoing operations...")
 					break
 				}
 				wg.Add(1)
-				go deleteArtifact(ctx, server, token, projectID, jobID, dryRun, verbose, &wg, sem, &successCounter, &failureCounter, &skippedCounter, logger)
+				go deleteArtifact(ctx, server, token, projectID, jobID, dryRun, verbose, &wg, sem, &successCounter, &failureCounter, &skippedCounter, &processedCounter, bar, logger)
 			}
 
 			wg.Wait()
+			if bar != nil {
+				bar.Finish()
+				fmt.Println() // Add spacing after progress bar
+			}
 			duration := time.Since(startTime)
 
 			// Print summary
-			fmt.Printf("\n========================\n")
-			fmt.Printf("Summary\n")
-			fmt.Printf("========================\n")
 			summary := fmt.Sprintf("Completed in %v. Successes: %d, Failures: %d, Skipped/NotFound: %d, Total: %d",
 				duration.Round(time.Millisecond), successCounter, failureCounter, skippedCounter, totalJobs)
 			fmt.Println(summary)
