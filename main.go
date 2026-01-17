@@ -94,7 +94,7 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		if verbose {
 			fmt.Println(msg)
 		} else if bar != nil {
-			bar.Add(1)
+			_ = bar.Add(1)
 		}
 		logger.Println(msg)
 		atomic.AddInt64(skippedCounter, 1)
