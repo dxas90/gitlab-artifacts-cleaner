@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -31,13 +32,7 @@ var httpClient = &http.Client{
 
 // Job represents a GitLab CI/CD job from the API
 type Job struct {
-	ID        int    `json:"id"`
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	Artifacts []struct {
-		FileType string `json:"file_type"`
-		Size     int    `json:"size"`
-	} `json:"artifacts"`
+	ID int `json:"id"`
 }
 
 func getEnv(key, defaultValue string) string {
@@ -79,7 +74,12 @@ func projectExists(ctx context.Context, server, token string, projectID int) (bo
 
 // listJobs fetches all jobs from a GitLab project with pagination
 func listJobs(ctx context.Context, server, token string, projectID, pageLimit int, logger *log.Logger) ([]Job, error) {
-	var allJobs []Job
+	// Pre-allocate slice with estimated capacity to reduce reallocations
+	estimatedCapacity := 100 // default for unlimited
+	if pageLimit > 0 {
+		estimatedCapacity = pageLimit * 100
+	}
+	allJobs := make([]Job, 0, estimatedCapacity)
 	page := 1
 	perPage := 100
 
@@ -90,8 +90,17 @@ func listJobs(ctx context.Context, server, token string, projectID, pageLimit in
 			return allJobs, ctx.Err()
 		}
 
-		apiURL := fmt.Sprintf("https://%s/api/v4/projects/%d/jobs?per_page=%d&page=%d",
-			server, projectID, perPage, page)
+		// Build URL efficiently with strings.Builder to reduce allocations
+		var urlBuilder strings.Builder
+		urlBuilder.WriteString("https://")
+		urlBuilder.WriteString(server)
+		urlBuilder.WriteString("/api/v4/projects/")
+		urlBuilder.WriteString(strconv.Itoa(projectID))
+		urlBuilder.WriteString("/jobs?per_page=")
+		urlBuilder.WriteString(strconv.Itoa(perPage))
+		urlBuilder.WriteString("&page=")
+		urlBuilder.WriteString(strconv.Itoa(page))
+		apiURL := urlBuilder.String()
 
 		req, err := http.NewRequest("GET", apiURL, nil)
 		if err != nil {
@@ -156,10 +165,23 @@ func deleteArtifact(ctx context.Context, server, token string, projectID, jobID 
 		return
 	}
 
-	apiURL := fmt.Sprintf("https://%s/api/v4/projects/%d/jobs/%d/artifacts", server, projectID, jobID)
+	// Build URL efficiently with strings.Builder
+	var urlBuilder strings.Builder
+	urlBuilder.WriteString("https://")
+	urlBuilder.WriteString(server)
+	urlBuilder.WriteString("/api/v4/projects/")
+	urlBuilder.WriteString(strconv.Itoa(projectID))
+	urlBuilder.WriteString("/jobs/")
+	urlBuilder.WriteString(strconv.Itoa(jobID))
+	urlBuilder.WriteString("/artifacts")
+	apiURL := urlBuilder.String()
 
 	if dryRun {
-		msg := fmt.Sprintf("Job %d: [DRY-RUN] Would delete artifact", jobID)
+		var msgBuilder strings.Builder
+		msgBuilder.WriteString("Job ")
+		msgBuilder.WriteString(strconv.Itoa(jobID))
+		msgBuilder.WriteString(": [DRY-RUN] Would delete artifact")
+		msg := msgBuilder.String()
 		if verbose {
 			fmt.Println(msg)
 		} else if bar != nil {

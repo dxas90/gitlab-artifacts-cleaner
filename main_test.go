@@ -46,8 +46,6 @@ func TestValidateInputs(t *testing.T) {
 		server      string
 		token       string
 		projectID   int
-		startJob    int
-		endJob      int
 		concurrency int
 		wantErr     bool
 	}{
@@ -56,8 +54,6 @@ func TestValidateInputs(t *testing.T) {
 			server:      "gitlab.example.com",
 			token:       "valid-token",
 			projectID:   1,
-			startJob:    1,
-			endJob:      10,
 			concurrency: 5,
 			wantErr:     false,
 		},
@@ -66,8 +62,6 @@ func TestValidateInputs(t *testing.T) {
 			server:      "",
 			token:       "valid-token",
 			projectID:   1,
-			startJob:    1,
-			endJob:      10,
 			concurrency: 5,
 			wantErr:     true,
 		},
@@ -76,8 +70,6 @@ func TestValidateInputs(t *testing.T) {
 			server:      "gitlab.example.com",
 			token:       "",
 			projectID:   1,
-			startJob:    1,
-			endJob:      10,
 			concurrency: 5,
 			wantErr:     true,
 		},
@@ -86,28 +78,6 @@ func TestValidateInputs(t *testing.T) {
 			server:      "gitlab.example.com",
 			token:       "valid-token",
 			projectID:   0,
-			startJob:    1,
-			endJob:      10,
-			concurrency: 5,
-			wantErr:     true,
-		},
-		{
-			name:        "invalid start job",
-			server:      "gitlab.example.com",
-			token:       "valid-token",
-			projectID:   1,
-			startJob:    0,
-			endJob:      10,
-			concurrency: 5,
-			wantErr:     true,
-		},
-		{
-			name:        "end job less than start job",
-			server:      "gitlab.example.com",
-			token:       "valid-token",
-			projectID:   1,
-			startJob:    10,
-			endJob:      5,
 			concurrency: 5,
 			wantErr:     true,
 		},
@@ -116,8 +86,6 @@ func TestValidateInputs(t *testing.T) {
 			server:      "gitlab.example.com",
 			token:       "valid-token",
 			projectID:   1,
-			startJob:    1,
-			endJob:      10,
 			concurrency: 0,
 			wantErr:     true,
 		},
@@ -126,26 +94,14 @@ func TestValidateInputs(t *testing.T) {
 			server:      "gitlab.example.com",
 			token:       "valid-token",
 			projectID:   1,
-			startJob:    1,
-			endJob:      10,
 			concurrency: 1001,
-			wantErr:     true,
-		},
-		{
-			name:        "job range too large",
-			server:      "gitlab.example.com",
-			token:       "valid-token",
-			projectID:   1,
-			startJob:    1,
-			endJob:      1000001,
-			concurrency: 5,
 			wantErr:     true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateInputs(tt.server, tt.token, tt.projectID, tt.startJob, tt.endJob, tt.concurrency)
+			err := validateInputs(tt.server, tt.token, tt.projectID, tt.concurrency)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateInputs() error = %v, wantErr %v", err, tt.wantErr)
 			}
